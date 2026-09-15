@@ -603,6 +603,17 @@ class Gemini(VLM_API):
             "modalities": ["TEXT", "IMAGE"],
             "max_tokens": 32768,
         },
+        # 3.1-generation image models. Same request/response shape as
+        # gemini-3-pro-image, so the call sites need no change beyond listing the
+        # ids in their stage-level registries (REMOVAL_MODELS / UPSAMPLE_MODELS).
+        "gemini-3.1-flash-image": {
+            "modalities": ["TEXT", "IMAGE"],
+            "max_tokens": 32768,
+        },
+        "gemini-3.1-flash-lite-image": {
+            "modalities": ["TEXT", "IMAGE"],
+            "max_tokens": 32768,
+        },
         "gemini-3.0-flash": {
             "modalities": ["TEXT"],
             "max_tokens": 65535,

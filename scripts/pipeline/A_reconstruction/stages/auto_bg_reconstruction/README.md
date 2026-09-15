@@ -19,7 +19,7 @@ bash scripts/pipeline/A_reconstruction/run.sh \
      s1_video.target_w=672 \
      s1_video.target_h=384 \
      s5_scene.pda_geometric_backend=depth_pro \
-     s11_sim.vlm_model=gemini-2.5-pro
+     s11_sim.vlm_model=gemini-2.5-flash
 ```
 
 Step 2: run the background add-on.

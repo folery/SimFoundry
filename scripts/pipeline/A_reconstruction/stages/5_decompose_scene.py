@@ -875,10 +875,12 @@ def main(cfg):
     removal_model_name = cfg.s5_scene.removal_model
     assert_valid_key(key=removal_model_name, valid_keys=REMOVAL_MODELS, name="removal model")
     if removal_model_name == "gemini":
+        # The `gemini` alias means "the default image model", not "a Pro model". Keep it in
+        # step with the config default, or the alias silently costs more than the YAML.
         removal_model = Gemini(
             project=cfg.gcloud_project,
             location="global",
-            model="gemini-3-pro-image",
+            model="gemini-2.5-flash-image",
         )
     elif "gemini" in removal_model_name:
         removal_model = Gemini(

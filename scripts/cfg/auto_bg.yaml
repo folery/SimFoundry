@@ -68,7 +68,7 @@ s1_quadmask:                                      # env: simfoundry — generate
   keyframe_idx: 0                                 # Which subsampled frame indexes the mask prompt
   floor_category: "${floor_category}"
   gcloud_project: "${gcloud_project}"
-  gemini_model: gemini-3-pro-image  # Used to identify tabletop objects to mask out (Vertex Gemini; must support IMAGE modality)
+  gemini_model: gemini-2.5-flash-image  # Used to identify tabletop objects to mask out (Vertex Gemini; must support IMAGE modality)
   sam_conf: 0.30                                  # SAM3 detection threshold
   mask_dilate_px: 12                              # Dilation kernel on the union mask (pixels)
   mp4_fps: "${void_mp4_fps}"
@@ -147,7 +147,7 @@ canonical_run_overrides:
   s1_video_target_h: 384
   s2_depth_backend: da3                           # orig-DA3 must be DA3 (the precondition checks the npz schema)
   s5_scene_pda_geometric_backend: depth_pro # PDA geometric backend for the gmask sub-stage
-  s11_sim_vlm_model: gemini-2.5-pro               # plain override (key exists; no `+`)
+  s11_sim_vlm_model: gemini-2.5-flash             # plain override (key exists; no `+`)
   # Stage 14: auto-exits via os._exit(0) when interactive=false (the default); run headless:
   s14_og_interactive: false                       # true keeps the OmniGibson viewer alive (hangs the batch run)
   s14_og_headless: true                           # OMNIGIBSON_HEADLESS=1 env var on the canonical run

@@ -133,7 +133,7 @@ s3_ground:    # env: simfoundry
       support_coverage: 0.10      # how much of the frame the support surface fills
       plane_quality: 0.10         # RANSAC inlier ratio of the support plane fit
   use_fs: false  # Set to true to use FoundationStereo output (s2_fs) instead of Depth Anything (s2_da)
-  detection_model: gemini-3.1-pro-preview   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview, gemini-3-flash-preview
+  detection_model: gemini-2.5-flash   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview, gemini-3-flash-preview
 s4_frame:     # env: simfoundry
   rerun: true
   out_dirname: s4_frame
@@ -166,10 +166,19 @@ s5_scene:     # env: simfoundry
   merge_output_images: true
   crop_removal_images: true
   # vlm_model: gemini-2.5-pro     # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3-pro
-  detection_model: gemini-3.1-pro-preview   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview, gemini-3-flash-preview
-  removal_model: gemini-3-pro-image     # options: gemini, gemini-3-pro-image, gemini-3-pro-image, flux
+  detection_model: gemini-2.5-flash   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview, gemini-3-flash-preview
+  removal_model: gemini-2.5-flash-image   # options: gemini, gemini-2.5-flash-image, gemini-3-pro-image, flux
   min_detection_iterations: 3
-  obj_removal_prompt_order: ["mask", "outline", "bbox"]   # options: mask, outline, bbox. For FLUX, use ["outline", "bbox"], mask is not stable.
+  # Order matters. `outline` first: the outline/bbox prompts ask for "all parts of the scene
+  # occluded behind and below it", but the mask prompt (prompt_utils.py:461) says only
+  # "Replace the bright green pixels with empty air" -- no reconstruction instruction at all,
+  # so Gemini returns a flat filled blob instead of a plausible surface. That blob is
+  # measurable (~105 grey levels brighter than the surrounding background on the PutCupInBowl
+  # capture) and stage 5's periodic re-detection (update_categories_period) then reports it as
+  # a brand-new object -- a phantom `knife` next to the pen. Both example captures reproduce
+  # this with mask first (PutCupInBowl -> knife, PutMarkerInCup -> wooden_block); both come out
+  # clean with outline first.
+  obj_removal_prompt_order: ["outline", "bbox", "mask"]   # options: mask, outline, bbox. For FLUX, use ["outline", "bbox"], mask is not stable.
   pda_K: 5
   pda_geometric_backend: da3    # options: depth_pro, da3  (geometric depth source for PriorDepthAnything)
   pda_da3_resolution: 504             # DA3 processing resolution (must be multiple of 14, only used when pda_geometric_backend=da3)
@@ -178,7 +187,7 @@ s6_upsample:      # env: simfoundry
   out_dirname: s6_upsample
   out_dir: "${root_dir}/${scene_name}/${s6_upsample.out_dirname}"
   sam_conf_threshold: 0.1
-  model: gemini-3-pro-image     # options: gemini, gemini-2.5-flash-image, gemini-3-pro-image, gpt, flux
+  model: gemini-2.5-flash-image     # options: gemini, gemini-2.5-flash-image, gemini-3-pro-image, gpt, flux
   validity_model: gemini
   infill: false    # If true, infill the object before upsampling
   check_valid: false  # If true, run validity check on each upsampled object
@@ -276,7 +285,7 @@ s8_pose:          # env: simfoundry
   est_refine_iter: 5  # Number of refinement iterations for FoundationPose
   object_indices: null  # null = all, or [1,2] for selective streaming/reruns
   canonicalize_front: true      # VLM front-pick; rotates the (uprighted) mesh front to +Z
-  front_pick_model: gemini-3.1-pro-preview
+  front_pick_model: gemini-2.5-flash
   # Fine yaw passes for tilt-baked (pixel-aligned) meshes ONLY — canonical backends land
   # exactly on the 45-degree grid and a re-pick can only move them off it.
   # front_refine: second VLM pass over +/-22.5 deg in 7.5-deg steps around the coarse pick.
@@ -312,12 +321,19 @@ s9_articulate_objects:
   rerun: true
   out_dirname: s9_articulate_objects
   out_dir: "${root_dir}/${scene_name}/${s9_articulate_objects.out_dirname}"
-  vlm_model: gemini-3.1-pro-preview
+  # Stage 9 is opt-in (--detect-articulation) and was not covered by the flash A/B, so these
+  # four ids are unvalidated on flash: articulation-tree decomposition is a harder structured
+  # task than anything the A/B measured. Kept at flash anyway, so that enabling s9 one day
+  # cannot silently bill Pro -- the failure mode here is loud (run_articulation raises on a
+  # missing URDF), not silent. If s9 is ever turned on, check its output rather than trusting it.
+  # Only `vlm_model` runs through this repo's Gemini client (relay), so it is the one with a
+  # visible relay cost; the other three are handed to the articulate-anything cfg below.
+  vlm_model: gemini-2.5-flash
   vlm_backend: vertex                 # [vertex] — routes all articulation VLM calls (classifier + s2/s4/s5) through Vertex AI Gemini using gcloud_project
   method: hunyuan # options : [hunyuan, partfield]
-  tree_model: gemini-3.1-pro-preview       # articulate-anything s2 VLM model
-  merge_model: gemini-3.1-pro-preview        # articulate-anything s4 VLM model
-  s5_model: gemini-3.1-pro-preview           # articulate-anything joint-refinement VLM model
+  tree_model: gemini-2.5-flash       # articulate-anything s2 VLM model
+  merge_model: gemini-2.5-flash        # articulate-anything s4 VLM model
+  s5_model: gemini-2.5-flash           # articulate-anything joint-refinement VLM model
   # Critic on: its rubric has a `joint_limit` category covering the failure mode seen on
   # reconstructed assets (wrong range/direction). Previously true, commented "avoid brittle
   # critic loop" - re-enable with max_iter>1 so a flagged joint actually gets a second attempt;
@@ -355,7 +371,7 @@ s11_sim:          # env: simfoundry
   rerun: true
   out_dirname: s11_sim
   out_dir: "${root_dir}/${scene_name}/${s11_sim.out_dirname}"
-  vlm_model: gemini-3.1-pro-preview   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview
+  vlm_model: gemini-2.5-flash   # options: gemini-2.5-pro, gemini-2.5-flash, gemini-3.1-pro-preview
   object_indices: null
   parallel_workers: 2
   collision_method: coacd
@@ -687,8 +703,8 @@ prompt_cousin_structured:      # env: simfoundry
   max_objects: null
   max_components: null
   max_generated_images_per_object: null
-  text_model: gemini-2.5-pro
-  image_model: gemini-3-pro-image
+  text_model: gemini-2.5-flash
+  image_model: gemini-2.5-flash-image
   remote_retries: 3
   check_reasonableness: true
   max_reasonableness_attempts: 3
@@ -762,7 +778,7 @@ scene_sampling:  # env: simfoundry -- Sample pose variants from a pre-built asse
 propose_scene_task:   # env: simfoundry -- Propose tasks for a scene using VLM
   rerun: true
   num_tasks: 5                                    # Number of tasks to propose
-  vlm_model: gemini-2.5-pro                       # VLM model to use
+  vlm_model: gemini-2.5-flash                     # VLM model to use
   remote_retries: 3
   out_dir: "${root_dir}/${scene_name}/proposed_tasks" # Output directory for proposed task YAMLs (files: {scene_name}_{task_name}.yaml)
   robot_type: franka                              # Robot type: franka, franka_robotiq, yam (affects prompt constraint)

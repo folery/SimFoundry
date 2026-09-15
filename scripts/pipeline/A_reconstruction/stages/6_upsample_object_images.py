@@ -86,10 +86,11 @@ def main(cfg):
     ratios = dict()
     invalid_objects = []
     if model_name == "gemini":
+        # Alias, not "a Pro model" -- see the same note in 5_decompose_scene.py.
         model = Gemini(
             project=cfg.gcloud_project,
             location="global",
-            model="gemini-3-pro-image",
+            model="gemini-2.5-flash-image",
         )
         for (out_w, out_h) in model.IMAGE_SHAPES:
             ratio = out_w / out_h
@@ -155,7 +156,7 @@ def main(cfg):
             validity_model = Gemini(
                 project=cfg.gcloud_project,
                 location="global",
-                model="gemini-3-pro-preview",
+                model="gemini-2.5-flash",
             )
         else:
             raise NotImplementedError

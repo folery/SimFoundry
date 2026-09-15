@@ -16,7 +16,7 @@
 #         --scene-name <scene> --video-fpath <video> --no-stream -- \
 #         s1_video.splat_prep=true s1_video.n_subsampled_frames=400 \
 #         s1_video.target_w=672 s1_video.target_h=384 \
-#         s5_scene.pda_geometric_backend=depth_pro s11_sim.vlm_model=gemini-2.5-pro
+#         s5_scene.pda_geometric_backend=depth_pro s11_sim.vlm_model=gemini-2.5-flash
 #   (Stage 2 uses the DA3 backend by default; stage 14 auto-exits via s14_og.interactive=false.)
 #
 # This script REUSES those outputs — it does NOT re-subsample, re-run orig-DA3, or

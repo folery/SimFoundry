@@ -13,15 +13,20 @@ from simfoundry.utils.processing_utils import resize_with_pad
 from .abstract_client import InferenceClient
 
 class OpenPIClient(InferenceClient):
-    def __init__(self, 
-                host:str = "localhost", 
+    def __init__(self,
+                host:str = "localhost",
                 port:int = 8000,
                 open_loop_horizon:int = 8,
+                api_key:str | None = None,
                  ) -> None:
         self.open_loop_horizon = open_loop_horizon
         print(f"Initializing OpenPI client with host: {host} and port: {port}")
+        # api_key is forwarded, not interpreted: the upstream client turns it into
+        # `Authorization: Api-Key <key>` and sends nothing when it is None. A
+        # gateway in front of the server rejects the websocket upgrade with 401
+        # otherwise, which surfaces as a connection error, not a policy error.
         self.client = websocket_client_policy.WebsocketClientPolicy(
-            host, port
+            host, port, api_key=api_key
         )
         print(f"OpenPI client initialized")
 

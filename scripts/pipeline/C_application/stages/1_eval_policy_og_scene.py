@@ -81,6 +81,176 @@ _DROID_EEF_ROTATION_CORRECT = np.array(
 # panda_link7 -> panda_link8 (EEF flange) is a +107 mm translation along link7's local Z.
 _PANDA_LINK7_TO_LINK8_Z = 0.107
 
+# Which joint direction CLOSES the gripper. This single fact decides the
+# controller's `inverted` flag and the gripper value sent to the policy, and the
+# two grippers this stage runs disagree, which is why they must not be set
+# independently:
+#
+#   franka_robotiq   revolute knuckles [0, 0.7854] rad -> closed = +, open = 0
+#   franka_panda     prismatic fingers [0, 0.04] m     -> closed = 0, open = 0.04
+#
+# OmniGibson states the robotiq direction outright in _handle_assisted_grasping
+# (manipulation_robot.py:1617-1619):
+#     "- Non-inverted: closed = lower   - Inverted: closed = upper"
+# so the inverted=True the gripper controller below is configured with makes the
+# UPPER knuckle limit (0.7854) the closed end. openpi fixes the other side
+# (docs/norm_stats.md:66): gripper 0.0 = fully open, 1.0 = fully closed.
+#
+# Measured on franka_robotiq from a rollout: with `gripper_invert=false` a policy
+# command of 0 (open) drove the knuckle to +0.7854 and a command of 1 (closed) to
+# 0.0 -- both backwards. Flipping `gripper_invert` back to its default and
+# sending `gripper_norm` (not `1 - gripper_norm`) fixes both halves.
+#
+# That answer is the robotiq's. It was carried as a module constant until a
+# panda-hand scene inverted the observation silently, which is what a constant
+# cannot avoid: the fact belongs to the end effector, so it is derived below.
+
+
+def finger_dofs_are_prismatic(robot, arm):
+    """True when the gripper's controlled joints translate rather than rotate.
+
+    Prismatic fingers (the panda hand) separate as their joint values grow; a revolute
+    linkage (the robotiq's knuckles) closes as theirs do. That one joint-type difference
+    is what makes every gripper convention in this file end-effector-dependent.
+
+    Only the joint limits are read, and only their units separate the two cases: a
+    prismatic finger's limits are metres and start at contact, a knuckle's radian range
+    is not a distance. No end effector is named, so a new one is classified by geometry
+    instead of by being added to a list.
+    """
+    # `gripper_control_idx` holds 0-dim tensors, not ints, and indexing a 1-D limit
+    # tensor with a list of tensors raises "too many indices for tensor of dimension 1".
+    # Convert once, here, so every caller below reads plain positions.
+    dof_idx = [int(i) for i in robot.gripper_control_idx[arm]]
+    lo = np.asarray(robot.joint_lower_limits[dof_idx].cpu().numpy(), dtype=float).ravel()
+    hi = np.asarray(robot.joint_upper_limits[dof_idx].cpu().numpy(), dtype=float).ravel()
+    return bool(len(dof_idx) == 2 and np.all(np.abs(lo) < 1e-6)
+                and np.all((hi > 0.005) & (hi < 0.2)))
+
+
+def measure_gripper_aperture(robot, arm):
+    """How far the gripper's fingers can separate, in metres -- measured, not assumed.
+
+    Which estimate is trustworthy depends on the joint type, so both are computed:
+
+      * prismatic fingers (the panda hand): their joint values are metres of finger
+        displacement away from contact, so the widest gap they can make is their
+        combined travel. That is the aperture.
+      * a revolute linkage (the robotiq): the values are radians and only geometry
+        answers, so take the distance between the finger links' origins in the pose
+        the scene installed -- fully open for both shipped Franka end effectors.
+
+    Neither branch asks which end of a joint's range means "open". That is exactly
+    what the two end effectors disagree about (see the table above), and why neither
+    this nor the observation encoding can be written as one constant.
+
+    Returns:
+        (aperture_m, method, cross_check_m) -- the cross-check is the estimate that
+        was NOT used, reported so a surprising aperture can be read against it.
+    """
+    links = list(robot.finger_links[arm])
+    origins = []
+    for link in links:
+        pos, _ = link.get_position_orientation()
+        origins.append(np.asarray(pos.cpu().numpy(), dtype=float))
+    origin_span = 0.0
+    for i in range(len(origins)):
+        for j in range(i + 1, len(origins)):
+            origin_span = max(origin_span, float(np.linalg.norm(origins[i] - origins[j])))
+
+    dof_idx = [int(i) for i in robot.gripper_control_idx[arm]]
+    lo = np.asarray(robot.joint_lower_limits[dof_idx].cpu().numpy(), dtype=float).ravel()
+    hi = np.asarray(robot.joint_upper_limits[dof_idx].cpu().numpy(), dtype=float).ravel()
+    if finger_dofs_are_prismatic(robot, arm):
+        return float(np.sum(hi - lo)), "prismatic finger travel", origin_span
+    return origin_span, "finger-link origin span", None
+
+
+def report_grasp_feasibility(env, cfg, robot):
+    """Warn when a scene object cannot fit between the gripper's fingers.
+
+    WHY: a run scored 0/20 milestones and nothing said why. The scene's apple was
+    112 mm across against a 99.7 mm aperture and its orange 134 mm; the sizes had to
+    be recovered by hand from `misc/metadata.json` afterwards. Reading them from the
+    physics AABBs costs one pass over the scene and needs no extra assets, so the
+    warning belongs next to the numbers it explains.
+
+    The margin is config -- `s15_eval.grasp_clearance`, metres, default 0.0 -- because
+    how much clearance a grasp needs is a property of the task, not of the code.
+
+    Returns a JSON-serialisable dict for `eval_results.json`, or None. Never raises:
+    a diagnostic that breaks a run is worse than the failure it was meant to explain.
+    """
+    try:
+        clearance = float(cfg.s15_eval.get("grasp_clearance", 0.0))
+        aperture, method, cross_check = measure_gripper_aperture(robot, robot.default_arm)
+        dof_names = list(robot.joints.keys())
+        gripper_dofs = [str(dof_names[int(i)])
+                        for i in robot.gripper_control_idx[robot.default_arm]]
+
+        rows = []
+        n_fixed = 0
+        for scene_obj in env.scene.objects:
+            if isinstance(scene_obj, BaseRobot):
+                continue
+            # Pinned objects are scenery -- the table, a wall. Nothing can grasp one, so
+            # measuring it against the aperture just prints a false "cannot be grasped"
+            # on every run and buries the real answer (which objects the policy must
+            # actually pick up).
+            if bool(getattr(scene_obj, "fixed_base", False)):
+                n_fixed += 1
+                continue
+            extents = np.asarray(scene_obj.aabb_extent.cpu().numpy(), dtype=float)
+            narrowest = float(np.min(extents))
+            rows.append({
+                "name": str(scene_obj.name),
+                "category": str(getattr(scene_obj, "category", "?")),
+                "extents_m": [round(float(v), 5) for v in extents],
+                "narrowest_m": round(narrowest, 5),
+                "clearance_m": round(aperture - clearance - narrowest, 5),
+                "fits": bool(aperture - clearance - narrowest > 0.0),
+            })
+        rows.sort(key=lambda r: r["clearance_m"])
+
+        report = {
+            "end_effector": str(getattr(robot, "end_effector", "?")),
+            "gripper_dof_names": gripper_dofs,
+            "aperture_m": round(aperture, 5),
+            "aperture_method": method,
+            "aperture_cross_check_m": None if cross_check is None else round(cross_check, 5),
+            "clearance_required_m": clearance,
+            "n_too_big": sum(1 for r in rows if not r["fits"]),
+            "n_fixed_skipped": n_fixed,
+            "objects": rows,
+        }
+
+        print(f"\n{'='*70}")
+        print(f"Grasp-size feasibility  (measured from the physics AABBs, before any episode)")
+        print(f"  end effector : {report['end_effector']}")
+        print(f"  gripper DOFs : {', '.join(gripper_dofs)}")
+        print(f"  aperture     : {aperture*1000:.1f} mm  ({method})")
+        if cross_check is not None:
+            print(f"  cross-check  : {cross_check*1000:.1f} mm  (not used)")
+        print(f"  required margin: {clearance*1000:.1f} mm  (s15_eval.grasp_clearance)")
+        if n_fixed:
+            print(f"  ({n_fixed} fixed_base object(s) skipped -- scenery, not grasp targets)")
+        print(f"  {'object':<22}{'narrowest':>11}{'clearance':>12}   verdict")
+        for r in rows:
+            verdict = "fits" if r["fits"] else "TOO BIG -- cannot be grasped"
+            print(f"  {r['name'][:22]:<22}{r['narrowest_m']*1000:>9.1f}mm"
+                  f"{r['clearance_m']*1000:>10.1f}mm   {verdict}")
+        if report["n_too_big"]:
+            print()
+            print(f"  !! {report['n_too_big']}/{len(rows)} scene objects are wider than the gripper")
+            print(f"  !! can open. No policy can pick them up; expect those milestones to fail.")
+            print(f"  !! Scale them down (objects_info.init_info[<obj>].args.scale) or fit a")
+            print(f"  !! wider end effector before reading any success rate as a policy result.")
+        print(f"{'='*70}\n")
+        return report
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never break a run
+        print(f"[grasp-size check] skipped ({type(exc).__name__}: {exc})")
+        return None
+
 
 def compute_droid_eef_9d(robot):
     """Compute DROID-convention eef_9d (xyz + rot6d) from a Franka OG robot.
@@ -129,7 +299,15 @@ def load_policy(cfg):
     if cfg.s15_eval.policy == "gr00t":
         return Gr00tClient(host=cfg.s15_eval.host, port=cfg.s15_eval.port, api_token=None, open_loop_horizon=cfg.s15_eval.execute_horizon)
     elif cfg.s15_eval.policy == "openpi":
-        return OpenPIClient(host=cfg.s15_eval.host, port=cfg.s15_eval.port, open_loop_horizon=cfg.s15_eval.execute_horizon)
+        # Read the key from the environment rather than the config so a shared
+        # YAML never carries a secret, and so the same config works against a
+        # local server (absent -> no auth) and a gated remote one.
+        return OpenPIClient(
+            host=cfg.s15_eval.host,
+            port=cfg.s15_eval.port,
+            open_loop_horizon=cfg.s15_eval.execute_horizon,
+            api_key=os.environ.get("SIMFOUNDRY_OPENPI_API_KEY"),
+        )
     elif cfg.s15_eval.policy == "dreamzero":
         return DreamZeroClient(host=cfg.s15_eval.host, port=cfg.s15_eval.port, open_loop_horizon=cfg.s15_eval.execute_horizon)
     else:
@@ -202,6 +380,30 @@ def main(cfg):
 
 
 
+    # Optionally render the robot's wrist camera at DROID's training aspect.
+    #
+    # OmniGibson's FrankaPanda ships the wrist camera at 128x128 (1:1); DROID -- and so the
+    # policy's training distribution -- uses 180x320 (16:9). FOV comes from focal_length and
+    # the apertures, so a 1:1 frame cannot be turned back into DROID's letterboxed 16:9 one by
+    # `resize_with_pad`; the training framing is simply not recoverable from it.
+    #
+    # This has to go into the robot's constructor args IN THE SCENE FILE, not be poked at on
+    # the live sensor: `env_base.reset()` raises "Observation space does not match returned
+    # observations!" when a sensor's shape changes after the env was built, and the subsequent
+    # crash takes the whole run down. Doing it here means the observation space is right from
+    # construction. Off by default -- this is an A/B variable, not a fix to assume.
+    wrist_res = cfg.s15_eval.get("wrist_sensor_resolution", None)
+    if wrist_res is not None:
+        wrist_h, wrist_w = int(wrist_res[0]), int(wrist_res[1])
+        for obj_name, obj_info in og_scene_json.get("objects_info", {}).get("init_info", {}).items():
+            if obj_name.startswith("robot") and "args" in obj_info:
+                sensor_kwargs = (obj_info["args"].setdefault("sensor_config", {})
+                                 .setdefault("VisionSensor", {})
+                                 .setdefault("sensor_kwargs", {}))
+                sensor_kwargs["image_height"] = wrist_h
+                sensor_kwargs["image_width"] = wrist_w
+                print(f"[wrist] {obj_name} sensor_config -> {wrist_h}x{wrist_w}")
+
     # Include the swap stem in the modified-scene filename so concurrent/sequential
     # sweeps over multiple swap combos do not clobber each other's scene JSONs.
     swap_suffix = f"_{swap_stem}" if swap_stem else ""
@@ -220,11 +422,38 @@ def main(cfg):
             obj_frictions[obj_info["name"]] = obj_info["friction"]
 
 
+    # A scene that ships a room scan must NOT also get a synthetic visible floor: both
+    # are opaque horizontal surfaces at (or very near) the same height, so they z-fight
+    # and the render is mostly the plane with the scan showing through as patches. That
+    # is exactly what happened when a `droid_v1` desk scan was attached to a scene whose
+    # eval ran with `s15_eval.floor_plane_visible=true`.
+    #
+    # The pipeline already knows this rule -- `14_create_og_scene.py:192-193` writes
+    # ``floor_plane_visible = not include_gs`` and ``use_skybox = not include_gs`` into the
+    # scene file it produces. The value is therefore already a property of the scene; this
+    # flag only ever *removes* the floor, never adds one behind the scene's back.
+    #
+    # (`use_skybox` is deliberately left alone: a GS background needs a skybox or it
+    # renders at ~4% brightness, which is the opposite requirement.)
+    has_background = any(
+        str(name).startswith(("mesh_background", "gs_background"))
+        for name in og_scene_json.get("objects_info", {}).get("init_info", {})
+    )
+    if has_background and cfg.s15_eval.floor_plane_visible:
+        print(
+            "[s15_eval] scene ships a background -> forcing floor_plane_visible=False "
+            "(a visible floor plane would z-fight the scan)"
+        )
+
     scene_cfg = {
         "type": "Scene",
         "scene_file": modified_scene_json_path,
         "use_floor_plane": cfg.s15_eval.use_floor_plane,
-        "floor_plane_visible": cfg.s15_eval.use_floor_plane and cfg.s15_eval.floor_plane_visible,
+        "floor_plane_visible": (
+            cfg.s15_eval.use_floor_plane
+            and cfg.s15_eval.floor_plane_visible
+            and not has_background
+        ),
         "use_skybox": True,
         "include_robots": True,
     }
@@ -243,11 +472,23 @@ def main(cfg):
     external_sensors_cfg_path = f"{SIMFOUNDRY_CFG_DIR}/external_sensors/{cfg.s15_eval.external_sensors_cfg}.yaml"
     external_sensors_cfg = parse_config(external_sensors_cfg_path)["external_sensors"]
     
-    # Set image resolution to 224x224 as expected by DROID/OpenPI models
-    for sensor_cfg in external_sensors_cfg:
-        if "sensor_kwargs" in sensor_cfg:
-            sensor_cfg["sensor_kwargs"]["image_height"] = 720
-            sensor_cfg["sensor_kwargs"]["image_width"] = 1280
+    # Optional override of the external cameras' resolution.
+    #
+    # This used to be unconditional at 720x1280 with a comment claiming "224x224 as expected by
+    # DROID/OpenPI" -- which matched neither the code nor the models. `nv_franka_droid.yaml`
+    # deliberately asks for 180x320, DROID's own training resolution, with `#720` / `#1280`
+    # commented out beside it; forcing 720x1280 silently overrode that choice. Left unset the
+    # YAML now wins. `+s15_eval.external_sensor_resolution=[720,1280]` reproduces the old run.
+    ext_res = cfg.s15_eval.get("external_sensor_resolution", None)
+    if ext_res is not None:
+        ext_h, ext_w = int(ext_res[0]), int(ext_res[1])
+        for sensor_cfg in external_sensors_cfg:
+            sensor_cfg.setdefault("sensor_kwargs", {})
+            sensor_cfg["sensor_kwargs"]["image_height"] = ext_h
+            sensor_cfg["sensor_kwargs"]["image_width"] = ext_w
+        print(f"[s15_eval] external sensor resolution forced to {ext_h}x{ext_w}")
+    else:
+        print("[s15_eval] external sensor resolution taken from the sensor YAML")
     
 
     env_cfg = {
@@ -299,6 +540,52 @@ def main(cfg):
     robot.reload_controllers(controller_cfg)
     env.scene.update_initial_file()
     print(f"[DEBUG] Reloaded controllers to JointController before HDF5 wrapping")
+
+    # --- TEMPORARY DIAGNOSTICS -------------------------------------------------
+    # The observation builder feeds the policy `qpos[:7]` and `qpos[-2:]` by
+    # *position*, so the DOF ordering is an assumption the code never checks. With
+    # a server-side `AbsoluteActions` output transform the returned joint targets
+    # are `model_delta + observation/joint_position`, i.e. they inherit whatever
+    # frame we sent -- a wrong order or a wrong zero would corrupt every action
+    # silently. Print the ground truth once, before any inference, so it can be
+    # compared against the values the client actually sends.
+    # Remove once the OpenPI integration is settled.
+    def _diag(label, fn):
+        try:
+            print(f"[DIAG] {label:<22}= {fn()}")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never break a run
+            print(f"[DIAG] {label:<22}! unavailable ({type(exc).__name__}: {exc})")
+
+    _diag("robot.name", lambda: robot.name)
+    _diag("DOF order", lambda: list(robot.joints.keys()))
+    _diag("arm_control_idx", lambda: {a: list(v) for a, v in robot.arm_control_idx.items()})
+    _diag("gripper_control_idx", lambda: {a: list(v) for a, v in robot.gripper_control_idx.items()})
+    _diag("default_arm", lambda: robot.default_arm)
+    _diag("default_joint_pos", lambda: robot.default_joint_pos.cpu().numpy().round(4).tolist())
+
+    def _dof_table():
+        lo = robot.joint_lower_limits.cpu().numpy()
+        hi = robot.joint_upper_limits.cpu().numpy()
+        return "\n" + "\n".join(
+            f"[DIAG]   dof[{i}] {n:<26} lower={lo[i]:>8.4f} upper={hi[i]:>8.4f}"
+            for i, n in enumerate(robot.joints)
+        )
+
+    _diag("per-DOF limits", _dof_table)
+
+    def _cam_table():
+        out = []
+        for sname, sensor in robot.sensors.items():
+            if isinstance(sensor, VisionSensor):
+                out.append(
+                    f"[DIAG]   sensor {sname:<30} "
+                    f"h={getattr(sensor, 'image_height', '?')} "
+                    f"w={getattr(sensor, 'image_width', '?')}"
+                )
+        return "\n" + "\n".join(out)
+
+    _diag("robot cameras", _cam_table)
+    # --- end TEMPORARY DIAGNOSTICS ---------------------------------------------
 
     # Wrap environment with data collection wrapper to save rollouts
     now = datetime.now()
@@ -397,6 +684,10 @@ def main(cfg):
                     mesh.apply_physics_material(default_mat)
 
     # Update camera params
+    #
+    # Only intrinsics are touched here. Resolution is NOT: it is set via the robot's
+    # `sensor_config` in the scene file above, because changing a sensor's shape after the env
+    # exists leaves the observation space stale and `env.reset()` then raises.
     for sensor_name, sensor in robot.sensors.items():
         if isinstance(sensor, VisionSensor):
             sensor.focal_length=2.8
@@ -432,7 +723,16 @@ def main(cfg):
     base_camera_2_name = cfg.s15_eval.base_camera_2_name
     interactive = cfg.s15_eval.get("interactive", False)
     save_video = cfg.s15_eval.get("save_video", False)
-    video_fps = cfg.s15_eval.get("video_fps", 10)
+    # Playback rate of the saved video. A frame is captured every `video_frame_stride`
+    # control steps and the environment advances one control step per `action_freq`
+    # Hz, so real time is `action_freq / video_frame_stride` fps. This used to be a
+    # flat 10, which played an h=8 episode 10*8/15 = 5.3x too fast: the frame cadence
+    # was right, the clock was not. `s15_eval.video_fps` still overrides it.
+    _stride_cfg = cfg.s15_eval.get("video_frame_stride", None)
+    video_stride = max(1, int(execute_horizon if _stride_cfg is None else _stride_cfg))
+    video_fps = cfg.s15_eval.get("video_fps", None)
+    if video_fps is None:
+        video_fps = float(action_freq) / video_stride
     video_resolution = cfg.s15_eval.get("video_resolution", None)
     save_per_camera_video = cfg.s15_eval.get("save_per_camera_video", False)
 
@@ -512,7 +812,30 @@ def main(cfg):
     
     # Initialize keyboard callbacks
     setup_keyboard_callbacks()
-    
+
+    # True when a larger finger value means MORE closed -- the policy's gripper
+    # observation and the robot's jaws have to agree on this, and the two Franka end
+    # effectors disagree (see the joint table near the top of this file). Resolved
+    # ONCE here, and guarded: a geometry probe that fails must fall back to the
+    # robotiq's answer -- what the constant this replaced always said -- rather than
+    # take the run down. Resolving it per episode would also re-read the robot every
+    # step for an answer that cannot change mid-run.
+    _pg_override = cfg.s15_eval.get("gripper_positive_grasps", None)
+    if _pg_override is not None:
+        positive_grasps = bool(_pg_override)
+        print(f"[gripper] positive_grasps={positive_grasps} "
+              f"(s15_eval.gripper_positive_grasps override)")
+    else:
+        try:
+            positive_grasps = not finger_dofs_are_prismatic(robot, robot.default_arm)
+        except Exception as exc:  # noqa: BLE001 - a probe must never kill the run
+            positive_grasps = True
+            print(f"[gripper] finger-type probe failed ({type(exc).__name__}: {exc}); "
+                  f"assuming the robotiq convention (positive_grasps=True)")
+        else:
+            print(f"[gripper] positive_grasps={positive_grasps} "
+                  f"(derived from the finger joint limits; robotiq=True, panda hand=False)")
+
     def run_episode(episode_idx: int):
         """Run a single evaluation episode."""
         nonlocal interrupt_flag, prev_status
@@ -561,13 +884,34 @@ def main(cfg):
         }
         
        
-        video_frames = [] if save_video else None
-        per_camera_frames = {"ext_0": [], "ext_1": [], "wrist": []} if (save_video and save_per_camera_video) else None
+        # Frames are streamed to a temporary file and renamed once the outcome is known,
+        # because the filename carries it (`_success` / `_fail`) while the frames come
+        # out during the episode. Buffering is not viable: at `video_frame_stride: 1` an
+        # episode is 1350 frames of 3 x 1280 x 720, about 11 GB.
+        video_writers = {}       # slot -> [imageio writer, temp path, frame count]
+
+        def append_video_frame(slot, frame):
+            """Stream one frame for `slot` ('combined', 'ext_0', ...), opening on first use."""
+            entry = video_writers.get(slot)
+            if entry is None:
+                tmp = f"{results_dir}/videos/.tmp_ep{episode_idx:03d}_{slot}.mp4"
+                Path(tmp).parent.mkdir(parents=True, exist_ok=True)
+                entry = [imageio.get_writer(tmp, fps=video_fps, macro_block_size=None), tmp, 0]
+                video_writers[slot] = entry
+            entry[0].append_data(np.ascontiguousarray(frame, dtype=np.uint8))
+            entry[2] += 1
         
         j = 0
 
-        # Get normalized gripper range
-        gripper_limit = robot.joint_upper_limits[robot.gripper_control_idx[robot.default_arm]].mean()
+        # Get normalized gripper range.
+        #
+        # The index set must come from the robot rather than from a positional guess, because
+        # the limit here and the position read in the loop below have to refer to the SAME
+        # joints. `qpos[-2:]` happens to be right on the 9-DOF Panda (arm 0-6, fingers 7-8)
+        # and wrong on the 15-DOF `franka_robotiq`, whose controlled knuckles are 7-8 while
+        # qpos[-2:] is 13-14 -- the mimic joints. Both now use `gripper_control_idx`.
+        gripper_idx = robot.gripper_control_idx[robot.default_arm]
+        gripper_limit = robot.joint_upper_limits[gripper_idx].mean()
 
 
         import sys
@@ -585,7 +929,7 @@ def main(cfg):
             
             # Get robot state
             qpos = robot.get_joint_positions()
-            gripper_norm = (qpos[-2:].mean() / gripper_limit).item()
+            gripper_norm = (qpos[gripper_idx].mean() / gripper_limit).item()
             
             # Construct observation for policy
             wrist_cam_key = None
@@ -624,7 +968,25 @@ def main(cfg):
             # Convert joints to numpy and ensure correct dtype
             joints_np = qpos[:7].numpy() if hasattr(qpos, 'numpy') else np.array(qpos[:7])
             joints_np = joints_np.astype(np.float32)
-            gripper_np = np.array([gripper_norm*2], dtype=np.float32)
+            # DROID expects 0=open / 1=closed in [0, 1] (openpi docs/norm_stats.md).
+            # `gripper_norm` is qpos/gripper_limit, so which end of [0, 1] "open"
+            # lands on depends on the gripper -- see `positive_grasps` above.
+            # Do NOT scale: the implementation this client was adapted from
+            # (sim-evals droid_jointpos) has a single finger_joint and sends
+            # joint_pos / (pi/4) with no factor, clipped to (0, 1). The earlier
+            # `gripper_norm * 2` sent 2.0 for "fully open" -- outside the model's
+            # input range.
+            #
+            # This was briefly `1.0 - gripper_norm` for BOTH grippers, which is
+            # right for the Panda hand and exactly backwards for the robotiq: it
+            # told the policy "fully closed" whenever the jaws were wide open, for
+            # the whole episode. With the action side also inverted the two errors
+            # did not cancel -- they compounded into a policy whose "open" command
+            # closed the gripper.
+            gripper_np = np.array(
+                [gripper_norm if positive_grasps else 1.0 - gripper_norm],
+                dtype=np.float32,
+            )
         
 
             # TODO: currently only works for DROID and pi05_droid_jointpos. Where should the observation keys be defined?
@@ -652,14 +1014,15 @@ def main(cfg):
                     vh, vw = int(video_resolution[0]), int(video_resolution[1])
                     imgs = [resize_with_pad(img, vh, vw) for img in imgs]
                 concat_frame = np.concatenate(imgs, axis=1)
-                video_frames.append(concat_frame)
-                if per_camera_frames is not None:
-                    per_camera_frames["ext_0"].append(imgs[0])
-                    per_camera_frames["ext_1"].append(imgs[1])
-                    per_camera_frames["wrist"].append(imgs[2])
+                append_video_frame("combined", concat_frame)
+                if save_per_camera_video:
+                    append_video_frame("ext_0", imgs[0])
+                    append_video_frame("ext_1", imgs[1])
+                    append_video_frame("wrist", imgs[2])
             
 
-            capture_video_frame()
+            # Frames are captured inside the action loop below, on `video_stride`.
+            #
             
             # Debug output on first inference of first episode
             if j == 0 and episode_idx == 0:
@@ -669,6 +1032,14 @@ def main(cfg):
                 print(f"  [Debug] joints shape: {joints_np.shape}, values: {joints_np}")
                 print(f"  [Debug] gripper: {gripper_np}")
                 print(f"  [Debug] prompt: {prompt}")
+                # Exactly what leaves the client, and in what order -- the state we
+                # send is the anchor the server's AbsoluteActions adds the model's
+                # delta to, so this is the reference to check the [DIAG] block against.
+                print(f"  [Debug] payload keys: {sorted(curr_obs)}")
+                for _k in sorted(curr_obs):
+                    _v = np.asarray(curr_obs[_k])
+                    _head = _v.ravel()[:8] if _v.ndim == 1 else ""
+                    print(f"  [Debug]   {_k:<32} {str(_v.shape):<18} {_v.dtype} {_head}")
             
 
             inference_result = policy.infer(curr_obs, prompt) # should return action chunk and viz images
@@ -720,6 +1091,13 @@ def main(cfg):
                 if gripper_binarize:
                     action[7] = 1.0 if action[7] > gripper_threshold else 0.0
                 
+                # Capture on the stride rather than per inference, so a
+                # `video_frame_stride` below `execute_horizon` shows the motion between
+                # two inferences. `video_fps` is derived from the same number, so the
+                # video stays real time at any stride.
+                if save_video and (j % video_stride) == 0:
+                    capture_video_frame()
+
                 obs, reward, terminated, truncated, info = env.step(action)
                 j += 1
                 max_episode_reward = max(max_episode_reward, reward)
@@ -766,7 +1144,7 @@ def main(cfg):
         episode_result["episode_reward"] = max_episode_reward  # Episode reward = max reward over all timesteps
         
         # Capture final video frame after episode ends (shows final state)
-        if save_video and video_frames is not None:
+        if save_video:
             # Get final observation state
             wrist_cam_key = None
             for key in obs[robot.name].keys():
@@ -800,11 +1178,11 @@ def main(cfg):
                 vh, vw = int(video_resolution[0]), int(video_resolution[1])
                 imgs_final = [resize_with_pad(img, vh, vw) for img in imgs_final]
             concat_frame = np.concatenate(imgs_final, axis=1)
-            video_frames.append(concat_frame)
-            if per_camera_frames is not None:
-                per_camera_frames["ext_0"].append(imgs_final[0])
-                per_camera_frames["ext_1"].append(imgs_final[1])
-                per_camera_frames["wrist"].append(imgs_final[2])
+            append_video_frame("combined", concat_frame)
+            if save_per_camera_video:
+                append_video_frame("ext_0", imgs_final[0])
+                append_video_frame("ext_1", imgs_final[1])
+                append_video_frame("wrist", imgs_final[2])
         
         # Final check for task success (in case it wasn't captured in the loop)
         if not episode_result["success"] and env.task.success:
@@ -829,28 +1207,40 @@ def main(cfg):
                 print(f"    {status} {milestone_name}")
             print(f"  Milestone progress: {episode_result['milestone_progress']:.2%}")
         
-        # Save video for this episode if enabled
-        if save_video and video_frames:
+        # Finalise the streamed videos: close each writer, then give every temp file the
+        # name it earned. Renaming at the end is what lets the name carry the outcome
+        # while the frames come out during the episode.
+        for _w, _tmp, _n in video_writers.values():
+            _w.close()
+        if "combined" in video_writers:
             video_dir = f"{results_dir}/videos"
             Path(video_dir).mkdir(parents=True, exist_ok=True)
             success_str = "success" if episode_result["success"] else "fail"
             video_path = f"{video_dir}/episode_{episode_idx:03d}_{success_str}.mp4"
-            print(f"  Saving video to: {video_path}")
-            imageio.mimwrite(video_path, video_frames, fps=video_fps)
+            _w, _tmp, _n = video_writers["combined"]
+            os.replace(_tmp, video_path)
             episode_result["video_path"] = video_path
+            print(f"  Saved video to: {video_path}  ({_n} frames @ {video_fps:.3f} fps)")
             
-            if per_camera_frames is not None:
+            if save_per_camera_video:
                 cameras_root = f"{video_dir}/cameras"
-                for cam_name, frames in per_camera_frames.items():
-                    if not frames:
+                for cam_name in ("ext_0", "ext_1", "wrist"):
+                    if cam_name not in video_writers:
                         continue
                     cam_video_dir = f"{cameras_root}/{cam_name}"
                     Path(cam_video_dir).mkdir(parents=True, exist_ok=True)
                     cam_video_path = f"{cam_video_dir}/episode_{episode_idx:03d}_{success_str}.mp4"
-                    imageio.mimwrite(cam_video_path, frames, fps=video_fps)
-                print(f"  Saved per-camera videos under: {cameras_root}/{{{','.join(per_camera_frames.keys())}}}/")
+                    os.replace(video_writers[cam_name][1], cam_video_path)
+                print(f"  Saved per-camera videos under: {cameras_root}/{{ext_0,ext_1,wrist}}/")
         
         return episode_result
+
+    # Sizes against the gripper, reported once before any episode runs. A scene whose
+    # goal objects do not fit between the fingers fails every episode for a reason no
+    # per-episode number can show, so it is checked here rather than inferred later.
+    grasp_report = report_grasp_feasibility(env, cfg, robot)
+    if grasp_report is not None:
+        results["grasp_feasibility"] = grasp_report
 
     # Run evaluation episodes
     if interactive:

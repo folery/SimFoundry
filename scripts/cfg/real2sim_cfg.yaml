@@ -410,7 +410,48 @@ s14_og:
     grasping_mode: assisted
     position: [-1.0, 0.0, 0.0]
     orientation: [0, 0, 0, 1]
+    # Wrist camera resolution, baked into the scene so every consumer sees the same thing.
+    # OmniGibson ships this sensor at 128x128 -- square -- but DROID, and so the policy's
+    # training data, is 16:9, and openpi letterboxes whatever it gets to 224x224, so a 1:1
+    # frame cannot be turned into the training framing. Raising it to 1280x720 took
+    # `picked_apple` from 1/10 to 8/10 on Data/fruits (reproduce_docs/OPENPI05_ADAPTATION.md §5).
+    # NOTE not purely a resolution knob: `1_eval` fixes horizontal_aperture/focal_length and
+    # USD derives verticalAperture from height/width, so the aspect here also sets the vFOV.
+    sensor_config:
+      VisionSensor:
+        sensor_kwargs:
+          image_height: 720
+          image_width: 1280
+  # Table (opt-in). `include_table` is the switch; the keys below say *which* table and
+  # *where*, so a scene's layout is passed on the command line instead of being edited into
+  # the stage. Every default reproduces the behaviour this stage had before the parameters
+  # existed, so leaving them alone changes nothing.
+  #
+  # Two shapes exist; only the second has been run. A table standing on the floor, with
+  # `table_lift_props` and `table_lift_robot` on so the props and the arm come up to its
+  # top -- the base has to rise with them, or the arm reaches the tabletop at ~86% of its
+  # span and nothing reports it. Or a tabletop sunk to the height the props are already at,
+  # driven by `table_position` alone: nothing moves, coplanarity cannot drift, and the legs
+  # vanish below the floor plane. Use `table_fixed_base` for the second, not `table_visual_only`.
   include_table: false
+  table_dataset: behavior-1k-assets
+  table_category: conference_table
+  table_model: qzmjrj
+  table_position: [0.5, 0.0, 0.0]
+  table_orientation: [0.0, 0.0, 0.0, 1.0]     # XYZW
+  # A table is scenery: left dynamic, an 82 kg body keeps moving after it has been measured
+  # (qzmjrj was measured at one height and came to rest 0.68 m away). Pin it unless there is
+  # a reason not to.
+  table_fixed_base: false
+  # Leave the physics to the floor plane, for a tabletop that sits at the height the props
+  # are already on and should not push them around. Caveat: `og.sim.save()` does not record a
+  # visual-only object's pose -- the run places it correctly, the saved scene says [0,0,0]
+  # with an identity orientation, and a reload puts it at the origin. Prefer `table_fixed_base`.
+  table_visual_only: false
+  # The floor-standing shape. Never used: see the two shapes above.
+  table_lift_props: false
+  table_lift_robot: false
+  table_clearance: 0.0                        # metres above the tabletop to start the props
   include_robot: true
   # Use the Gaussian-splat background from the auto_bg_reconstruction pipeline. Off by default
   # because stage 2c (the splat producer) is opt-in via --bg-splat: leaving this on made the
@@ -489,7 +530,12 @@ s15_eval:       # env: b1k -- Evaluate Gr00t checkpoint on OmniGibson scene
   floor_plane_visible: false
   external_sensors_cfg: nv_franka_droid   # Located in <CFG_DIR>/external_sensors
   action_freq: 15                         # Action frequency in Hz
-  timeout_s: 90                            # Maximum episode timeout in seconds
+  # Episode budget: `n_steps = timeout_s * action_freq` = 1350 control steps, i.e. 90 s.
+  # Left at the repo default deliberately -- what a scene needs is a property of that scene,
+  # and every run in this session passed `s15_eval.timeout_s=120` from its own launcher (the
+  # repo's recipe, ServeFruitsOnGreenPlate.yaml:261, also uses 120). Raising it here would
+  # double every eval and quietly break step-count comparability with earlier arms.
+  timeout_s: 90
   execute_horizon: 8                     # Number of actions to execute per policy inference
   n_episodes: 20                          # Number of evaluation episodes
   init_states_path: null                  # Optional path to init_states.json for deterministic evals
@@ -499,7 +545,18 @@ s15_eval:       # env: b1k -- Evaluate Gr00t checkpoint on OmniGibson scene
   base_camera_2_name: external_cam1_left  # Name of the second external camera (DROID exterior_image_2)
   interactive: false                      # If true, drops into IPython for interactive evaluation
   save_video: true                        # If true, saves video of policy observations per episode
-  video_fps: 10                             # FPS for saved videos
+  # Playback rate of the saved videos. `null` derives it so the video runs at the speed the
+  # episode actually took: one frame per `video_frame_stride` control steps at `action_freq`
+  # Hz gives `action_freq / video_frame_stride` fps -- h=8 is 15/8 = 1.875 fps, and the video
+  # then lasts `timeout_s` seconds whatever the budget is. This was a flat 10, which played
+  # an h=8 episode 10*8/15 = 5.3x too fast: the frames were right, the clock was not. Set a
+  # number to force a speed-up.
+  video_fps: null
+  # Capture one frame every N control steps. `null` = one per policy inference
+  # (= execute_horizon), the cadence every earlier run used. 1 gives a smooth 1:1 video at
+  # `action_freq` fps; frames are streamed to disk rather than buffered, because a full
+  # episode at stride 1 is `timeout_s * action_freq` frames of 3 x 1280 x 720.
+  video_frame_stride: null
 s15_annotate:     # env: b1k
   rerun: true
   out_dirname: s15_annotation

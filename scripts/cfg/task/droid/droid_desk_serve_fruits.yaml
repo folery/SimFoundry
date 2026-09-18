@@ -124,9 +124,27 @@ og_task_config:
   #       behind: [0.02, 0.05]
   #       in_front_of: [0.01, 0.03]
   #     z_offset: 0.0
-  workspace_bounds:              # workspace limits in robot base frame (meters)
-    lower: [0.3, -0.05, -1.0]
-    upper: [0.8, 0.05, 1.0]
+  # Workspace limits in the robot base frame (metres). The task pulls non-robot objects
+  # back into them on reset -- `randomize_object_pose` intersects the requested offset
+  # range with them, and an object already outside gets an intersection that runs
+  # *backwards*, so it is dragged toward the bounds every episode.
+  #
+  # y was the real defect: the props sit at y' -0.313..+0.192 and the old [-0.05, 0.05]
+  # could not hold any of them, so pear/banana/orange were shifted 7-12 cm on every
+  # unpinned reset. The published reference scene oversteps it too (teal_tray at y'
+  # +0.282), so the band was too narrow for the task, not for this scene.
+  #
+  # x is capped at the arm's reach (~0.855 m): a "workspace limit" that admits a point the
+  # arm cannot get to is a licence to fail. The reference scene's orange_square_plate
+  # reconstructs at x' 0.900, i.e. already beyond it. Only pear/banana/apple/orange get
+  # their *final* pose from this band -- orange_square_plate and teal_tray are re-placed
+  # next to the banana afterwards by `group_predicate_placement`, which discards the
+  # randomized pose. Measured over the 4 that this band does govern, the old band shifted
+  # 3 of them 73-125 mm per reset; this one shifts none, and leaves 0.4% of placements
+  # beyond reach instead of 1.4%. Pinned runs are unaffected either way.
+  workspace_bounds:
+    lower: [0.30, -0.35, -1.0]
+    upper: [0.86, 0.25, 1.0]
   prevent_predicate_overlap: true
   overlap_separation_multiplier: 1.5
   # additional_objects: {}

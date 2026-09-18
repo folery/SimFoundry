@@ -236,35 +236,50 @@ def main(cfg):
 
     scene = env.scene
     z_offset = 0.0
+    lift_props = False
     table = None  # Initialize table variable
 
     if not include_gs:
         if cfg.s14_og.include_table:
-            # Add conference table to the scene
+            pinned = bool(cfg.s14_og.get("table_fixed_base", False))
             table = DatasetObject(
                 name="conference_table",
-                dataset_name="behavior-1k-assets",
-                category="conference_table",  # Using breakfast_table as it's more common; can use conference_table if available
-                model="qzmjrj",  # A specific model; will use first available if this doesn't exist
+                dataset_name=cfg.s14_og.get("table_dataset", "behavior-1k-assets"),
+                category=cfg.s14_og.get("table_category", "conference_table"),
+                model=cfg.s14_og.get("table_model", "qzmjrj"),
+                fixed_base=pinned,
+                visual_only=bool(cfg.s14_og.get("table_visual_only", False)),
             )
             scene.add_object(table)
 
-            # Position table at origin with standard orientation
-            table_position = th.tensor([0.5, 0.0, 0.0])
-            table_orientation = th.tensor([0.0, 0.0, 0.0, 1.0])  # Identity quaternion (w, x, y, z)
-            table.set_position_orientation(position=table_position, orientation=table_orientation)
+            table_position = th.tensor(cfg.s14_og.get("table_position", [0.5, 0.0, 0.0]))
+            table_orientation = th.tensor(cfg.s14_og.get("table_orientation",
+                                                        [0.0, 0.0, 0.0, 1.0]))  # XYZW
+            table.set_position_orientation(position=table_position,
+                                           orientation=table_orientation)
 
-            # Step simulation to get table dimensions
+            # A pinned table is already where it was put; an unpinned one has to settle
+            # before it can be measured -- an 82 kg body was measured at one height and
+            # came to rest 0.68 m away. A visual-only table is not in the physics sim.
             og.sim.play()
-            for i in range(10):
+            for _ in range(1 if pinned else 10):
                 og.sim.step()
+            if not pinned and not cfg.s14_og.get("table_visual_only", False):
+                table.keep_still()
 
-            # Get table's top surface Z coordinate (assumes table is axis-aligned)
-            table_aabb = table.aabb
-            z_offset = table_aabb[1][2]  # Max Z of bounding box
+            # Read from the table, not assumed: this dataset's origin sits near the
+            # tabletop (its collider spans -0.674 m to +0.048 m about it), not at its base.
+            table_top = float(table.aabb[1][2])
+            # Raising every prop by the same amount preserves the arrangement the pipeline
+            # built, so only the support height moves. Zero is what a tabletop sunk to the
+            # props' own height wants.
+            lift_props = bool(cfg.s14_og.get("table_lift_props", False))
+            z_offset = (table_top + float(cfg.s14_og.get("table_clearance", 0.0))
+                        if lift_props else 0.0)
 
-            print(f"Table positioned at {table_position}")
-            print(f"Table top surface at Z = {z_offset}")
+            print(f"Table at {table_position}, orientation (XYZW) {table_orientation}")
+            print(f"Table top surface at Z = {table_top:.4f}; props lifted by "
+                  f"{z_offset:.4f} m (table_lift_props={lift_props})")
     else:
         og.sim.play()
         for i in range(10):
@@ -298,7 +313,10 @@ def main(cfg):
             # Preserve X, Y but adjust Z to be on table
             # We'll adjust after getting object's own height
             adjusted_pos = original_pos.clone()
-            adjusted_pos[2] -= 0.005
+            # Lift by the tabletop height when the props were raised onto one; otherwise
+            # keep the small drop every existing scene was built with.
+            adjusted_pos[2] = ((original_pos[2] + z_offset) if lift_props
+                               else (original_pos[2] - 0.005))
             # Set position temporarily to get object dimensions
             obj.set_position_orientation(position=adjusted_pos, orientation=original_ori)
             og.sim.step()
@@ -426,7 +444,13 @@ def main(cfg):
         # joint_targets = robot.default_arm_poses["gripper_down"]
         # joint_targets = robot.default_arm_poses["home"]
         # joint_targets = th.cat([robot.reset_joint_pos[:-2], th.tensor([1.0])])
-        robot_position = th.tensor(cfg.s14_og.robot_config.position)
+        # What matters is not the absolute height -- the policy sees no world z, so a
+        # scene translated vertically is invisible to it -- but that the base and the
+        # objects stay coplanar: a base left at 0 while the props rose 0.74 m has to reach
+        # the tabletop at ~86% of its ~0.86 m span, which nothing reports.
+        robot_position = th.tensor(cfg.s14_og.robot_config.position).clone()
+        if cfg.s14_og.get("table_lift_robot", False) and lift_props:
+            robot_position[2] = robot_position[2] + z_offset
 
         robot.set_position_orientation(
             position=robot_position,

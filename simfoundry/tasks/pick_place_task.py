@@ -35,6 +35,25 @@ from simfoundry.tasks.predicates import (
     check_inside_aabb,
 )
 from simfoundry.tasks.task_utils import compute_look_at_orientation, obj_is_settled, randomize_object_pose
+
+
+# Backgrounds are spelled two ways. The light editor stamps
+# ``mesh_background_<n>`` -- ``light_editor/background_io.py`` sets
+# ``BACKGROUND_OBJECT_NAME = "mesh_background_0"`` -- while hand-written and older
+# scenes use the bare ``mesh_background`` / ``gs_background``. Every name comparison
+# below used to test only the bare spelling, so an editor-authored scene silently had
+# no background as far as this task was concerned: it logged "No background found,
+# setting to None" and left ``self._background`` unset. That included the curated
+# ``droid_desk_serve_fruits`` reference scene, which really does ship a desk scan.
+# Compare by prefix so both spellings are recognised.
+_BACKGROUND_NAME_PREFIXES = ("gs_background", "mesh_background")
+
+
+def is_background_object(obj) -> bool:
+    """True if @obj (an object or a name) is the scene's room / scan background."""
+    name = obj if isinstance(obj, str) else getattr(obj, "name", "")
+    return any(name == p or name.startswith(f"{p}_") for p in _BACKGROUND_NAME_PREFIXES)
+
 from simfoundry.utils.ground_plane_utils import (
     apply_ground_plane_info,
     describe as describe_ground_plane,
@@ -326,8 +345,14 @@ class PickPlaceTask(BaseTask):
             og.sim.skybox.color = [1.0, 1.0, 1.0]
             og.sim.skybox.intensity = 1000.0
 
-        gs_background = env.scene.object_registry("name", "gs_background")
-        mesh_background = env.scene.object_registry("name", "mesh_background")
+        gs_background = next(
+            (o for o in env.scene.objects if o.name == "gs_background" or o.name.startswith("gs_background_")),
+            None,
+        )
+        mesh_background = next(
+            (o for o in env.scene.objects if o.name == "mesh_background" or o.name.startswith("mesh_background_")),
+            None,
+        )
         if gs_background is not None:
             print("Setting up 3DGS background...")
             # Set proxy from 3DGS background to ground floorplane
@@ -553,7 +578,7 @@ class PickPlaceTask(BaseTask):
         for obj in env.scene.objects:
             if isinstance(obj, BaseRobot):
                 continue
-            if obj.name == "gs_background" or obj.name == "mesh_background":
+            if is_background_object(obj):
                 continue  # already shifted above
             obj_pos, obj_ori = obj.get_position_orientation()
             obj_pos[2] += z_offset
@@ -701,12 +726,10 @@ class PickPlaceTask(BaseTask):
         Returns:
             bool: True if stable (all objects within thresholds), False otherwise.
         """
-        skip_names = {"gs_background", "mesh_background"}
-
         # Record pre-physics poses of all non-robot, non-fixed objects
         pre_poses = {}
         for obj in env.scene.objects:
-            if isinstance(obj, BaseRobot) or obj.fixed_base or obj.name in skip_names:
+            if isinstance(obj, BaseRobot) or obj.fixed_base or is_background_object(obj):
                 continue
             pos, quat = obj.get_position_orientation()
             pre_poses[obj.name] = (pos.clone(), quat.clone())
